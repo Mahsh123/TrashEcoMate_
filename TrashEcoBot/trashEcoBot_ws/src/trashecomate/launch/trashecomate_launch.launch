@@ -1,0 +1,5 @@
+<launch>
+    <node pkg="trashecomate" type="firebase_listener.py" name="firebase_listener" output="screen"/>
+    <node pkg="trashecomate" type="robot_movement.py" name="motor_control" output="screen"/>
+</launch>
+
