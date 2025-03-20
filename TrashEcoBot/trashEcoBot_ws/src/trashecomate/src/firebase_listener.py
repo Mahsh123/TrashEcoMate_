@@ -3,41 +3,41 @@ import rospy
 import firebase_admin
 from firebase_admin import credentials, db
 from std_msgs.msg import Int32
+import os
 
-# Initialize Firebase with explicit error handling
+# Firebase setup
+cred_path = os.getenv("FIREBASE_CREDENTIALS", "/home/sam/waste_management_robot/serviceAccountKey.json")
+firebase_url = os.getenv("FIREBASE_URL", "https://trashecomate-default-rtdb.asia-southeast1.firebasedatabase.app/")
 try:
-    cred = credentials.Certificate("/home/sam/waste_management_robot/serviceAccountKey.json")
-    firebase_admin.initialize_app(cred, {
-        "databaseURL": "https://trashecomate-default-rtdb.asia-southeast1.firebasedatabase.app/"  # Replace with your actual URL
-    })
+    cred = credentials.Certificate(cred_path)
+    firebase_admin.initialize_app(cred, {"databaseURL": firebase_url})
     rospy.loginfo("Firebase initialized successfully")
 except Exception as e:
     rospy.logerr(f"Failed to initialize Firebase: {e}")
     exit(1)
 
-def check_bin_status():
-    # Initialize ROS node
+# Firebase reference
+waste_level_ref = db.reference("bins/sensor1/wasteLevel")
+
+def firebase_listener():
     rospy.init_node("firebase_listener", anonymous=True)
     pub = rospy.Publisher("/bin_level", Int32, queue_size=10)
-    rate = rospy.Rate(1)  # 1 Hz
+    rate = rospy.Rate(1)  # Publish every second
 
     while not rospy.is_shutdown():
         try:
-            # Get bin status from Firebase
-            ref = db.reference("bins/sensor1")
-            bin_data = ref.get()
-            if bin_data and "wasteLevel" in bin_data:
-                bin_level = bin_data["wasteLevel"]
-                rospy.loginfo(f"Bin Level: {bin_level}%")
-                pub.publish(bin_level)
+            waste_level = waste_level_ref.get()
+            if waste_level is not None:
+                rospy.loginfo(f"Publishing waste level: {waste_level}%")
+                pub.publish(waste_level)
             else:
-                rospy.logwarn("No wasteLevel data found in Firebase")
+                rospy.logwarn("No waste level data in Firebase")
         except Exception as e:
-            rospy.logerr(f"Firebase error: {e}")
+            rospy.logerr(f"Failed to read from Firebase: {e}")
         rate.sleep()
 
 if __name__ == "__main__":
     try:
-        check_bin_status()
+        firebase_listener()
     except rospy.ROSInterruptException:
         pass
