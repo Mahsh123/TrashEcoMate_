@@ -8,17 +8,22 @@ import time
 import os
 import numpy as np
 
-# GPIO Pins for L293D
+# GPIO Pins for L293D and Servo
 LEFT_IN1, LEFT_IN2 = 17, 18
 RIGHT_IN3, RIGHT_IN4 = 27, 22
 TRIG, ECHO = 23, 24
 ENABLE_1, ENABLE_2 = 19, 12
+SERVO_PIN = 13  # Servo motor pin (adjust as needed)
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
-GPIO.setup([LEFT_IN1, LEFT_IN2, RIGHT_IN3, RIGHT_IN4, TRIG, ENABLE_1, ENABLE_2], GPIO.OUT)
+GPIO.setup([LEFT_IN1, LEFT_IN2, RIGHT_IN3, RIGHT_IN4, TRIG, ENABLE_1, ENABLE_2, SERVO_PIN], GPIO.OUT)
 GPIO.setup(ECHO, GPIO.IN)
 GPIO.output([ENABLE_1, ENABLE_2], GPIO.HIGH)
+
+# Servo setup using PWM
+servo = GPIO.PWM(SERVO_PIN, 50)  # 50 Hz PWM frequency for servo
+servo.start(0)  # Initialize servo at 0% duty cycle
 
 # Firebase setup
 cred_path = os.getenv("FIREBASE_CREDENTIALS", "/home/sam/waste_management_robot/serviceAccountKey.json")
@@ -34,7 +39,7 @@ except Exception as e:
 status_ref = db.reference("robot/status")
 
 # Q-Learning setup
-actions = ["forward", "backward", "turn_right", "stop"]
+actions = ["forward", "backward", "turn_right", "turn_left", "stop"]
 num_actions = len(actions)
 distance_bins = [0, 10, 20, 50, 999]  # Discretize distance into bins
 num_states = len(distance_bins) - 1
@@ -53,6 +58,13 @@ def choose_action(state):
     if np.random.uniform(0, 1) < epsilon:
         return np.random.randint(num_actions)  # Explore
     return np.argmax(q_table[state])  # Exploit
+
+def set_servo_angle(angle):
+    # Convert angle to duty cycle (0° to 180° maps to 2.5% to 12.5% duty cycle)
+    duty = 2.5 + (angle / 18.0)  # Linear mapping for 0-180 degrees
+    servo.ChangeDutyCycle(duty)
+    time.sleep(0.5)  # Allow time for servo to move
+    servo.ChangeDutyCycle(0)  # Stop sending signal to prevent jitter
 
 def move_forward():
     GPIO.output(LEFT_IN1, GPIO.HIGH)
@@ -86,6 +98,21 @@ def turn_right():
     except Exception as e:
         rospy.logerr(f"Firebase status update failed: {e}")
     rospy.loginfo("Turning Right")
+    time.sleep(0.5)  # Turn for 0.5 seconds
+    move_forward()
+
+def turn_left():
+    GPIO.output(LEFT_IN1, GPIO.LOW)
+    GPIO.output(LEFT_IN2, GPIO.LOW)
+    GPIO.output(RIGHT_IN3, GPIO.HIGH)
+    GPIO.output(RIGHT_IN4, GPIO.LOW)
+    try:
+        status_ref.set("Turning Left")
+    except Exception as e:
+        rospy.logerr(f"Firebase status update failed: {e}")
+    rospy.loginfo("Turning Left")
+    time.sleep(0.5)  # Turn for 0.5 seconds
+    move_forward()
 
 def stop():
     GPIO.output([LEFT_IN1, LEFT_IN2, RIGHT_IN3, RIGHT_IN4], GPIO.LOW)
@@ -110,6 +137,23 @@ def get_distance():
     rospy.loginfo(f"Measured distance: {distance:.2f} cm")
     return distance
 
+def look_left():
+    set_servo_angle(170)  # Look left
+    distance = get_distance()
+    set_servo_angle(90)  # Return to center
+    return distance
+
+def look_right():
+    set_servo_angle(10)  # Look right
+    distance = get_distance()
+    set_servo_angle(90)  # Return to center
+    return distance
+
+def look_front():
+    set_servo_angle(90)  # Look front
+    distance = get_distance()
+    return distance
+
 def check_bin_status():
     try:
         waste_level = rospy.wait_for_message("/bin_level", Int32, timeout=5).data
@@ -124,6 +168,9 @@ def motor_control():
     check_interval = 30  # Check bin status every 30 seconds
     last_check_time = time.time()
     collecting = False
+
+    # Initialize servo position
+    set_servo_angle(90)  # Start facing forward
 
     while not rospy.is_shutdown():
         # Check bin status every 30 seconds
@@ -156,29 +203,67 @@ def motor_control():
                 rospy.loginfo("Waste level <= 90%, robot idle")
             last_check_time = current_time
 
-        # If collecting, navigate using Q-learning
+        # If collecting, navigate with servo-based scanning
         if collecting:
-            distance = get_distance()
-            state = discretize_distance(distance)
-            action_idx = choose_action(state)
-            action = actions[action_idx]
+            distance_front = look_front()
+            state = discretize_distance(distance_front)
 
-            # Execute action
-            if action == "forward":
-                move_forward()
-                reward = 1 if distance >= 20 else -1
-            elif action == "backward":
-                move_backward()
-                reward = 0 if distance < 20 else -1
-            elif action == "turn_right":
-                turn_right()
-                reward = 0 if distance < 20 else -1
-            else:
+            if distance_front < 20 and distance_front != 999:
                 stop()
-                reward = -0.5
+                rospy.loginfo("Obstacle detected in front, scanning surroundings")
+                distance_left = look_left()
+                distance_right = look_right()
+                distance_front = look_front()  # Recheck front
+
+                # Determine safest direction
+                distances = {
+                    "left": distance_left,
+                    "right": distance_right,
+                    "front": distance_front
+                }
+                safest_direction = max(distances, key=distances.get)
+                safest_distance = distances[safest_direction]
+                rospy.loginfo(f"Safest direction: {safest_direction} with distance {safest_distance:.2f} cm")
+
+                if safest_distance < 20:
+                    # No safe direction, move backward
+                    move_backward()
+                    time.sleep(1)
+                    stop()
+                    reward = -1
+                else:
+                    if safest_direction == "left":
+                        turn_left()
+                        reward = 1
+                    elif safest_direction == "right":
+                        turn_right()
+                        reward = 1
+                    else:
+                        move_forward()
+                        reward = 1
+            else:
+                # No obstacle, use Q-learning for navigation
+                action_idx = choose_action(state)
+                action = actions[action_idx]
+
+                if action == "forward":
+                    move_forward()
+                    reward = 1 if distance_front >= 20 else -1
+                elif action == "backward":
+                    move_backward()
+                    reward = 0 if distance_front < 20 else -1
+                elif action == "turn_right":
+                    turn_right()
+                    reward = 0 if distance_front < 20 else -1
+                elif action == "turn_left":
+                    turn_left()
+                    reward = 0 if distance_front < 20 else -1
+                else:
+                    stop()
+                    reward = -0.5
 
             # Update Q-table
-            next_distance = get_distance()
+            next_distance = look_front()
             next_state = discretize_distance(next_distance)
             q_table[state, action_idx] = q_table[state, action_idx] + alpha * (reward + gamma * np.max(q_table[next_state]) - q_table[state, action_idx])
         else:
@@ -187,10 +272,12 @@ def motor_control():
         rospy.sleep(0.5)  # Check every 0.5 seconds for smooth navigation
 
     stop()
+    servo.stop()
 
 if __name__ == "__main__":
     try:
         motor_control()
     except rospy.ROSInterruptException:
         stop()
+        servo.stop()
         GPIO.cleanup()
