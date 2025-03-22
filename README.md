@@ -8,6 +8,7 @@ A comprehensive waste management system comprising:
 The system uses Firebase for data synchronization, enabling efficient waste collection by monitoring bin levels and controlling the robot's navigation with obstacle avoidance using an ultrasonic sensor mounted on a servo motor. Lightweight machine learning (Q-learning) enhances navigation for smarter obstacle avoidance.
 
 ## Project Structure
+```
 TrashEcoMate/
 ├── TrashEcoBot/
 │   ├── trashEcoBot_ws/
@@ -27,7 +28,7 @@ TrashEcoMate/
 │   # (Flutter app code to be added)
 ├── .gitignore
 └── README.md
-
+```
 
 ## Prerequisites
 
