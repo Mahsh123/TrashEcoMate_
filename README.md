@@ -72,8 +72,9 @@ Navigate to the ROS workspace:
 cd TrashEcoBot/trashEcoBot_ws
 catkin_make
 source devel/setup.bash
-Ensure the servo motor is connected to GPIO 13 (Physical Pin 33) on the Raspberry Pi, with the ultrasonic sensor mounted on top.
 ```
+Ensure the servo motor is connected to GPIO 13 (Physical Pin 33) on the Raspberry Pi, with the ultrasonic sensor mounted on top.
+
 ### 4. Upload TrashEcoBin Code
 Open TrashEcoBin/bin_sensor.ino in the Arduino IDE.
 Configure Firebase credentials in a config.h file (not tracked by Git):
