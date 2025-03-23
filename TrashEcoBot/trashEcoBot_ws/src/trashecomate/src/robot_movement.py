@@ -7,14 +7,17 @@ from std_msgs.msg import Int32
 import time
 import os
 import numpy as np
+import signal
+import sys
 
 # GPIO Pins for L293D and Servo
 LEFT_IN1, LEFT_IN2 = 17, 18
 RIGHT_IN3, RIGHT_IN4 = 27, 22
 TRIG, ECHO = 23, 24
 ENABLE_1, ENABLE_2 = 19, 12
-SERVO_PIN = 13  # Servo motor pin (adjust as needed)
+SERVO_PIN = 13  # Servo motor pin (Physical Pin 33)
 
+# Initialize GPIO
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 GPIO.setup([LEFT_IN1, LEFT_IN2, RIGHT_IN3, RIGHT_IN4, TRIG, ENABLE_1, ENABLE_2, SERVO_PIN], GPIO.OUT)
@@ -60,7 +63,6 @@ def choose_action(state):
     return np.argmax(q_table[state])  # Exploit
 
 def set_servo_angle(angle):
-    # Convert angle to duty cycle (0° to 180° maps to 2.5% to 12.5% duty cycle)
     duty = 2.5 + (angle / 18.0)  # Linear mapping for 0-180 degrees
     servo.ChangeDutyCycle(duty)
     time.sleep(0.5)  # Allow time for servo to move
@@ -123,19 +125,33 @@ def stop():
     rospy.loginfo("Stopping")
 
 def get_distance():
-    GPIO.output(TRIG, True)
-    time.sleep(0.00001)
-    GPIO.output(TRIG, False)
-    start_time = time.time()
-    stop_time = time.time()
-    while GPIO.input(ECHO) == 0 and time.time() - start_time < 0.1:
+    try:
+        GPIO.output(TRIG, True)
+        time.sleep(0.00001)
+        GPIO.output(TRIG, False)
+
         start_time = time.time()
-    while GPIO.input(ECHO) == 1 and time.time() - start_time < 0.1:
         stop_time = time.time()
-    elapsed = stop_time - start_time
-    distance = (elapsed * 34300) / 2 if elapsed > 0 else 999
-    rospy.loginfo(f"Measured distance: {distance:.2f} cm")
-    return distance
+
+        # Wait for ECHO to go high (start of echo pulse)
+        while GPIO.input(ECHO) == 0 and time.time() - start_time < 0.1:
+            start_time = time.time()
+
+        # Wait for ECHO to go low (end of echo pulse)
+        while GPIO.input(ECHO) == 1 and time.time() - start_time < 0.1:
+            stop_time = time.time()
+
+        elapsed = stop_time - start_time
+        if elapsed <= 0 or time.time() - start_time >= 0.1:
+            rospy.logwarn("Ultrasonic sensor timeout or invalid reading, returning default distance")
+            return 999  # Default distance if sensor fails
+
+        distance = (elapsed * 34300) / 2
+        rospy.loginfo(f"Measured distance: {distance:.2f} cm")
+        return distance
+    except Exception as e:
+        rospy.logerr(f"Error in get_distance: {e}")
+        return 999  # Return default distance on error
 
 def look_left():
     set_servo_angle(170)  # Look left
@@ -162,6 +178,17 @@ def check_bin_status():
     except rospy.ROSException as e:
         rospy.logwarn(f"Failed to receive bin level: {e}")
         return None
+
+def cleanup():
+    rospy.loginfo("Cleaning up resources")
+    stop()
+    servo.stop()
+    GPIO.cleanup()
+
+def signal_handler(sig, frame):
+    rospy.loginfo("Termination signal received, cleaning up")
+    cleanup()
+    sys.exit(0)
 
 def motor_control():
     rospy.init_node("motor_control", anonymous=True)
@@ -205,15 +232,24 @@ def motor_control():
 
         # If collecting, navigate with servo-based scanning
         if collecting:
+            rospy.loginfo("Entering navigation loop")
             distance_front = look_front()
             state = discretize_distance(distance_front)
+            action_idx = None  # Initialize action_idx
+            reward = 0  # Initialize reward
 
             if distance_front < 20 and distance_front != 999:
+                # Move backward to avoid hitting the object
                 stop()
-                rospy.loginfo("Obstacle detected in front, scanning surroundings")
+                move_backward()
+                time.sleep(1)  # Move backward for 1 second
+                stop()
+                rospy.loginfo("Moved backward to avoid obstacle, now scanning surroundings")
+
+                # Scan surroundings after moving back
                 distance_left = look_left()
                 distance_right = look_right()
-                distance_front = look_front()  # Recheck front
+                distance_front = look_front()
 
                 # Determine safest direction
                 distances = {
@@ -226,25 +262,30 @@ def motor_control():
                 rospy.loginfo(f"Safest direction: {safest_direction} with distance {safest_distance:.2f} cm")
 
                 if safest_distance < 20:
-                    # No safe direction, move backward
+                    # No safe direction, move backward again
                     move_backward()
                     time.sleep(1)
                     stop()
+                    action_idx = actions.index("backward")
                     reward = -1
                 else:
                     if safest_direction == "left":
                         turn_left()
+                        action_idx = actions.index("turn_left")
                         reward = 1
                     elif safest_direction == "right":
                         turn_right()
+                        action_idx = actions.index("turn_right")
                         reward = 1
                     else:
                         move_forward()
+                        action_idx = actions.index("forward")
                         reward = 1
             else:
                 # No obstacle, use Q-learning for navigation
                 action_idx = choose_action(state)
                 action = actions[action_idx]
+                rospy.loginfo(f"Q-learning chose action: {action}")
 
                 if action == "forward":
                     move_forward()
@@ -265,19 +306,28 @@ def motor_control():
             # Update Q-table
             next_distance = look_front()
             next_state = discretize_distance(next_distance)
-            q_table[state, action_idx] = q_table[state, action_idx] + alpha * (reward + gamma * np.max(q_table[next_state]) - q_table[state, action_idx])
+            if action_idx is not None:
+                q_table[state, action_idx] = q_table[state, action_idx] + alpha * (reward + gamma * np.max(q_table[next_state]) - q_table[state, action_idx])
+            else:
+                rospy.logwarn("action_idx is None, skipping Q-table update")
+
         else:
             stop()
 
         rospy.sleep(0.5)  # Check every 0.5 seconds for smooth navigation
 
-    stop()
-    servo.stop()
-
 if __name__ == "__main__":
+    # Handle termination signals (e.g., Ctrl+C)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     try:
         motor_control()
     except rospy.ROSInterruptException:
-        stop()
-        servo.stop()
-        GPIO.cleanup()
+        rospy.loginfo("ROS interrupted, cleaning up")
+        cleanup()
+    except Exception as e:
+        rospy.logerr(f"Unexpected error: {e}")
+        cleanup()
+    finally:
+        cleanup()
