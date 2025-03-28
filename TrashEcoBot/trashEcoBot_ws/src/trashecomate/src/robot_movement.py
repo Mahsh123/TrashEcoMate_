@@ -9,6 +9,8 @@ import os
 import numpy as np
 import signal
 import sys
+import math
+
 
 # GPIO Pins for L293D and Servo
 LEFT_IN1, LEFT_IN2 = 17, 18
@@ -51,6 +53,19 @@ alpha = 0.1  # Learning rate
 gamma = 0.9  # Discount factor
 epsilon = 0.1  # Exploration rate
 
+# Robot position and orientation
+robot_x = 0.0  # Starting position (x-coordinate in meters)
+robot_y = 0.0  # Starting position (y-coordinate in meters)
+robot_angle = 0.0  # Orientation in degrees (0 = facing positive x-axis, 90 = positive y-axis)
+
+# Target location (e.g., bin location in the room)
+target_x = 2.0  # meters
+target_y = 1.0  # meters
+
+# Robot movement parameters
+SPEED = 0.5  # meters per second (adjust based on your robot's actual speed)
+TURN_TIME = 0.5  # seconds to turn 90 degrees
+
 def discretize_distance(distance):
     for i in range(len(distance_bins) - 1):
         if distance_bins[i] <= distance < distance_bins[i + 1]:
@@ -68,7 +83,14 @@ def set_servo_angle(angle):
     time.sleep(0.5)  # Allow time for servo to move
     servo.ChangeDutyCycle(0)  # Stop sending signal to prevent jitter
 
-def move_forward():
+def move_forward(distance=None):
+    global robot_x, robot_y
+    if distance is None:
+        # Default behavior for Q-learning (move for 1 second)
+        duration = 1.0
+    else:
+        # Move a specific distance for targeted navigation
+        duration = distance / SPEED
     GPIO.output(LEFT_IN1, GPIO.HIGH)
     GPIO.output(LEFT_IN2, GPIO.LOW)
     GPIO.output(RIGHT_IN3, GPIO.HIGH)
@@ -77,9 +99,22 @@ def move_forward():
         status_ref.set("Moving Forward")
     except Exception as e:
         rospy.logerr(f"Firebase status update failed: {e}")
-    rospy.loginfo("Moving Forward")
+    rospy.loginfo(f"Moving Forward for {duration:.2f} seconds")
+    time.sleep(duration)
+    # Update robot position based on orientation
+    move_distance = SPEED * duration
+    robot_x += move_distance * math.cos(math.radians(robot_angle))
+    robot_y += move_distance * math.sin(math.radians(robot_angle))
+    stop()
 
-def move_backward():
+def move_backward(distance=None):
+    global robot_x, robot_y
+    if distance is None:
+        # Default behavior for Q-learning (move for 1 second)
+        duration = 1.0
+    else:
+        # Move a specific distance for targeted navigation
+        duration = distance / SPEED
     GPIO.output(LEFT_IN1, GPIO.LOW)
     GPIO.output(LEFT_IN2, GPIO.HIGH)
     GPIO.output(RIGHT_IN3, GPIO.LOW)
@@ -88,9 +123,16 @@ def move_backward():
         status_ref.set("Moving Backward")
     except Exception as e:
         rospy.logerr(f"Firebase status update failed: {e}")
-    rospy.loginfo("Moving Backward")
+    rospy.loginfo(f"Moving Backward for {duration:.2f} seconds")
+    time.sleep(duration)
+    # Update robot position based on orientation
+    move_distance = SPEED * duration
+    robot_x -= move_distance * math.cos(math.radians(robot_angle))
+    robot_y -= move_distance * math.sin(math.radians(robot_angle))
+    stop()
 
 def turn_right():
+    global robot_angle
     GPIO.output(LEFT_IN1, GPIO.HIGH)
     GPIO.output(LEFT_IN2, GPIO.LOW)
     GPIO.output(RIGHT_IN3, GPIO.LOW)
@@ -100,10 +142,12 @@ def turn_right():
     except Exception as e:
         rospy.logerr(f"Firebase status update failed: {e}")
     rospy.loginfo("Turning Right")
-    time.sleep(0.5)  # Turn for 0.5 seconds
-    move_forward()
+    time.sleep(TURN_TIME)  # Turn for 0.5 seconds (90 degrees)
+    robot_angle = (robot_angle - 90) % 360  # Update orientation
+    stop()
 
 def turn_left():
+    global robot_angle
     GPIO.output(LEFT_IN1, GPIO.LOW)
     GPIO.output(LEFT_IN2, GPIO.LOW)
     GPIO.output(RIGHT_IN3, GPIO.HIGH)
@@ -113,8 +157,9 @@ def turn_left():
     except Exception as e:
         rospy.logerr(f"Firebase status update failed: {e}")
     rospy.loginfo("Turning Left")
-    time.sleep(0.5)  # Turn for 0.5 seconds
-    move_forward()
+    time.sleep(TURN_TIME)  # Turn for 0.5 seconds (90 degrees)
+    robot_angle = (robot_angle + 90) % 360  # Update orientation
+    stop()
 
 def stop():
     GPIO.output([LEFT_IN1, LEFT_IN2, RIGHT_IN3, RIGHT_IN4], GPIO.LOW)
@@ -179,6 +224,37 @@ def check_bin_status():
         rospy.logwarn(f"Failed to receive bin level: {e}")
         return None
 
+
+def navigate_to_target(target_x, target_y):
+    global robot_x, robot_y, robot_angle
+    # Calculate the distance and angle to the target
+    dx = target_x - robot_x
+    dy = target_y - robot_y
+    distance = math.sqrt(dx**2 + dy**2)
+    target_angle = math.degrees(math.atan2(dy, dx))  # Angle to target in degrees
+
+    # Calculate the angle to turn
+    angle_diff = (target_angle - robot_angle) % 360
+    if angle_diff > 180:
+        angle_diff -= 360
+
+    # Turn to face the target
+    if abs(angle_diff) > 5:  # Allow small tolerance
+        if angle_diff > 0:
+            rospy.loginfo(f"Turning left by {angle_diff:.2f} degrees")
+            while angle_diff > 0:
+                turn_left()
+                angle_diff -= 90
+        else:
+            rospy.loginfo(f"Turning right by {-angle_diff:.2f} degrees")
+            while angle_diff < 0:
+                turn_right()
+                angle_diff += 90
+
+    return distance  # Return the remaining distance to the target
+
+
+
 def cleanup():
     rospy.loginfo("Cleaning up resources")
     stop()
@@ -232,6 +308,20 @@ def motor_control():
 
         # If collecting, navigate with servo-based scanning
         if collecting:
+            if navigating_to_target:
+                # Navigate to the target location
+                remaining_distance = navigate_to_target(target_x, target_y)
+                if remaining_distance < 0.1:  # Stop when within 10 cm of target
+                    navigating_to_target = False
+                    collecting = False
+                    try:
+                        status_ref.set("Idle")
+                    except Exception as e:
+                        rospy.logerr(f"Firebase status update failed: {e}")
+                    rospy.loginfo(f"Reached target location ({target_x}, {target_y}), stopping collection")
+                    continue
+
+            # After turning (or if not navigating to target), use Q-learning for navigation and obstacle avoidance
             rospy.loginfo("Entering navigation loop")
             distance_front = look_front()
             state = discretize_distance(distance_front)
@@ -241,8 +331,7 @@ def motor_control():
             if distance_front < 20 and distance_front != 999:
                 # Move backward to avoid hitting the object
                 stop()
-                move_backward()
-                time.sleep(1)  # Move backward for 1 second
+                move_backward(0.5)  # Move backward 0.5 meters
                 stop()
                 rospy.loginfo("Moved backward to avoid obstacle, now scanning surroundings")
 
@@ -263,8 +352,7 @@ def motor_control():
 
                 if safest_distance < 20:
                     # No safe direction, move backward again
-                    move_backward()
-                    time.sleep(1)
+                    move_backward(0.5)
                     stop()
                     action_idx = actions.index("backward")
                     reward = -1
@@ -278,7 +366,7 @@ def motor_control():
                         action_idx = actions.index("turn_right")
                         reward = 1
                     else:
-                        move_forward()
+                        move_forward(0.5)  # Move forward 0.5 meters
                         action_idx = actions.index("forward")
                         reward = 1
             else:
@@ -288,10 +376,10 @@ def motor_control():
                 rospy.loginfo(f"Q-learning chose action: {action}")
 
                 if action == "forward":
-                    move_forward()
+                    move_forward(0.5)  # Move forward 0.5 meters
                     reward = 1 if distance_front >= 20 else -1
                 elif action == "backward":
-                    move_backward()
+                    move_backward(0.5)
                     reward = 0 if distance_front < 20 else -1
                 elif action == "turn_right":
                     turn_right()
@@ -315,6 +403,7 @@ def motor_control():
             stop()
 
         rospy.sleep(0.5)  # Check every 0.5 seconds for smooth navigation
+
 
 if __name__ == "__main__":
     # Handle termination signals (e.g., Ctrl+C)
