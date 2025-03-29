@@ -271,6 +271,7 @@ def motor_control():
     check_interval = 30  # Check bin status every 30 seconds
     last_check_time = time.time()
     collecting = False
+    navigating_to_target = False  # Flag to switch between Q-learning and targeted navigation
 
     # Initialize servo position
     set_servo_angle(90)  # Start facing forward
@@ -291,6 +292,7 @@ def motor_control():
 
             if waste_level > 90:
                 collecting = True
+                navigating_to_target = True  # Start targeted navigation to the bin
                 try:
                     status_ref.set("Active")
                 except Exception as e:
@@ -298,6 +300,7 @@ def motor_control():
                 rospy.loginfo("Waste level > 90%, starting collection")
             else:
                 collecting = False
+                navigating_to_target = False
                 stop()
                 try:
                     status_ref.set("Idle")
