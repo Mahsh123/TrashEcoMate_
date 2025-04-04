@@ -45,6 +45,7 @@ except Exception as e:
     exit(1)
 
 status_ref = db.reference("robot/status")
+waste_level_ref = db.reference("bins/sensor1/wasteLevel")
 
 # Q-Learning setup
 actions = ["forward", "backward", "turn_right", "turn_left", "stop"]
@@ -69,6 +70,13 @@ target_y = 1.0  # meters
 SPEED = 0.5  # meters per second (adjust based on your robot's actual speed)
 TURN_TIME = 0.5  # seconds to turn 90 degrees
 MOVE_DISTANCE = 0.5  # meters per move
+
+# Global variable to store the latest waste level, initialized to None
+latest_waste_level = None
+def bin_level_callback(msg):
+    global latest_waste_level
+    latest_waste_level = msg.data
+    rospy.loginfo(f"Received bin level: {latest_waste_level}%")
 
 def discretize_distance(distance):
     for i in range(len(distance_bins) - 1):
@@ -221,13 +229,25 @@ def look_front():
     return distance
 
 def check_bin_status():
-    try:
-        waste_level = rospy.wait_for_message("/bin_level", Int32, timeout=5).data
-        rospy.loginfo(f"Checked bin status: {waste_level}%")
-        return waste_level
-    except rospy.ROSException as e:
-        rospy.logwarn(f"Failed to receive bin level: {e}")
-        return None
+    global latest_waste_level
+    # First, try to get the waste level from the ROS topic
+    if latest_waste_level is not None:
+        rospy.loginfo(f"Using latest bin level from ROS topic: {latest_waste_level}%")
+        return latest_waste_level
+    else:
+        rospy.logwarn("No recent bin level from ROS topic, falling back to Firebase")
+        # Fallback to Firebase if ROS topic fails
+        try:
+            waste_level = waste_level_ref.get()
+            if waste_level is not None:
+                rospy.loginfo(f"Retrieved bin level from Firebase: {waste_level}%")
+                return waste_level
+            else:
+                rospy.logwarn("No waste level data in Firebase")
+                return None
+        except Exception as e:
+            rospy.logerr(f"Failed to retrieve bin level from Firebase: {e}")
+            return None
 
 
 def navigate_to_target(target_x, target_y):
@@ -267,8 +287,14 @@ COLLECTING = 3
 def motor_control():
     state = IDLE
     last_state_change_time = time.time()
-    check_interval = 30  # Check bin status every 30 seconds
-    last_check_time = time.time()
+    check_interval = 5  # Reduced to 5 seconds for faster response
+    last_check_time = 0  # Initialize to 0 to force an immediate check
+
+    # Initialize ROS node
+    rospy.init_node("motor_control", anonymous=True)
+
+    # Subscribe to /bin_level topic
+    rospy.Subscriber("/bin_level", Int32, bin_level_callback)
 
     set_servo_angle(90)  # Start facing forward
 
@@ -307,6 +333,7 @@ def motor_control():
         if state == NAVIGATING:
             remaining_distance = navigate_to_target(target_x, target_y)
             distance_front = look_front()
+            rospy.loginfo(f"Distance to target: {remaining_distance:.2f} meters, Front distance: {distance_front:.2f} cm")
             if remaining_distance < 0.1:
                 state = COLLECTING
                 try:
@@ -324,6 +351,8 @@ def motor_control():
                 state = AVOIDING
                 move_backward(MOVE_DISTANCE / SPEED)  # Move back 0.5 meters
                 rospy.loginfo("Obstacle detected, entering avoidance mode")
+            else:
+                move_forward(MOVE_DISTANCE / SPEED)  # Move forward if no obstacle
 
         elif state == AVOIDING:
             distance_left = look_left()
@@ -335,17 +364,20 @@ def motor_control():
             safest_distance = distances[safest_direction]
             rospy.loginfo(f"Safest direction: {safest_direction} with distance {safest_distance:.2f} cm")
 
+            # Map safest_direction to the corresponding action
+            action_map = {"left": "turn_left", "right": "turn_right", "front": "forward"}
+            action = "backward" if safest_distance < 20 else action_map[safest_direction]
+
             if safest_distance < 20:
                 move_backward(MOVE_DISTANCE / SPEED)  # Move back again if no safe path
                 state = AVOIDING  # Stay in avoidance mode
             else:
-                # Confirm the new direction is clear
                 if safest_direction == "left":
                     turn_left()
                     time.sleep(0.1)
                     if look_front() < 20:
-                        turn_right()  # Revert if still obstructed
-                        turn_right()  # Turn back to original direction
+                        turn_right()
+                        turn_right()
                         state = AVOIDING
                     else:
                         move_forward(MOVE_DISTANCE / SPEED)
@@ -354,8 +386,8 @@ def motor_control():
                     turn_right()
                     time.sleep(0.1)
                     if look_front() < 20:
-                        turn_left()  # Revert if still obstructed
-                        turn_left()  # Turn back to original direction
+                        turn_left()
+                        turn_left()
                         state = AVOIDING
                     else:
                         move_forward(MOVE_DISTANCE / SPEED)
@@ -364,9 +396,9 @@ def motor_control():
                     move_forward(MOVE_DISTANCE / SPEED)
                     state = NAVIGATING
 
-            # Update Q-table
+            # Update Q-table with the correct action
             state_idx = discretize_distance(distance_front)
-            action_idx = actions.index("backward" if safest_distance < 20 else safest_direction)
+            action_idx = actions.index(action)
             reward = 1 if safest_distance >= 20 else -1
             next_distance = look_front()
             next_state = discretize_distance(next_distance)
@@ -379,7 +411,6 @@ def motor_control():
         elif state == IDLE:
             stop()
 
-        # Non-blocking delay to prevent 1-second stops
         rospy.sleep(0.01)
 
 def cleanup():
@@ -395,6 +426,7 @@ def signal_handler(sig, frame):
     rospy.loginfo("Termination signal received, cleaning up")
     cleanup()
     sys.exit(0)
+
 
 
 if __name__ == "__main__":
